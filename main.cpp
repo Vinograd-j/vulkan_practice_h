@@ -14,10 +14,17 @@ const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
 };
 
-#ifdef NDEBUG
-constexpr bool enableValidationLayers = false;
+#ifdef __MACH__
+    std::vector<const char*> requiredDeviceExtension = { vk::KHRSwapchainExtensionName, "VK_KHR_portability_subset" };
 #else
-constexpr bool enableValidationLayers = true;
+    std::vector<const char*> requiredDeviceExtension = { vk::KHRSwapchainExtensionName };
+#endif
+
+
+#ifdef NDEBUG
+    constexpr bool enableValidationLayers = false;
+#else
+    constexpr bool enableValidationLayers = true;
 #endif
 
 static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(vk::DebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -29,8 +36,6 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(vk::DebugUtilsMessageSever
 
     return vk::False;
 }
-
-std::vector<const char*> requiredDeviceExtension = {vk::KHRSwapchainExtensionName};
 
 class HelloTriangleApplication
 {
@@ -53,11 +58,21 @@ private:
 
     vk::DebugUtilsMessengerEXT _debugMessenger {};
 
+    vk::SurfaceKHR _surface {};
+
     vk::PhysicalDevice _physicalDevice {};
 
     vk::Device _device {};
 
     vk::Queue _graphicsQueue {};
+
+    vk::Extent2D _swapChainExtent {};
+
+    vk::SurfaceFormatKHR _surfaceFormat {};
+
+    vk::SwapchainKHR _swapChain {};
+    std::vector<vk::Image> _swapChainImages {};
+    std::vector<vk::ImageView> _swapChainImageViews {};
 
 private:
 
@@ -75,8 +90,11 @@ private:
     {
         CreateInstance();
         SetupDebugMessenger();
+        CreateSurface();
         PickPhysicalDevice();
         CreateLogicalDevice();
+        CreateSwapChain();
+        CreateImageViews();
     }
 
     void MainLoop()
@@ -89,8 +107,19 @@ private:
 
     void Cleanup()
     {
-        glfwDestroyWindow(_window);
+        if (enableValidationLayers)
+            _instance.destroyDebugUtilsMessengerEXT(_debugMessenger);
 
+        _device.destroySwapchainKHR(_swapChain);
+
+        for (auto& imageView : _swapChainImageViews)
+            _device.destroyImageView(imageView);
+
+        vkDestroySurfaceKHR(_instance, _surface, nullptr);
+        _device.destroy();
+        _instance.destroy();
+
+        glfwDestroyWindow(_window);
         glfwTerminate();
     }
 
@@ -110,7 +139,7 @@ private:
         appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-        appInfo.apiVersion = vk::ApiVersion14;
+        appInfo.apiVersion = vk::ApiVersion13;
 
         auto requiredExtensions = GetRequiredInstanceExtensions();
 
@@ -150,6 +179,10 @@ private:
         createInfo.enabledLayerCount = static_cast<uint32_t>(requiredLayers.size());
         createInfo.ppEnabledLayerNames = requiredLayers.data();
 
+#ifdef __MACH__
+        createInfo.flags = vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
+#endif
+
         _instance = vk::createInstance(createInfo);
 
         VULKAN_HPP_DEFAULT_DISPATCHER.init(_instance);
@@ -173,6 +206,15 @@ private:
         debugUtilsMessengerCreateInfoEXT.pfnUserCallback = &debugCallback;
 
         _debugMessenger = _instance.createDebugUtilsMessengerEXT( debugUtilsMessengerCreateInfoEXT );
+    }
+
+    void CreateSurface()
+    {
+        VkSurfaceKHR surface;
+        if (glfwCreateWindowSurface(_instance, _window, nullptr, &surface) != VK_SUCCESS)
+            throw std::runtime_error("failed to create window surface");
+
+        _surface = surface;
     }
 
     bool IsDeviceSuitable(const vk::PhysicalDevice& physicalDevice) const
@@ -225,15 +267,22 @@ private:
     void CreateLogicalDevice()
     {
         std::vector<vk::QueueFamilyProperties> queueFamilyProperties = _physicalDevice.getQueueFamilyProperties();
+        uint32_t queueIndex = ~0;
+        for (uint32_t qfpIndex = 0; qfpIndex < queueFamilyProperties.size(); ++qfpIndex)
+        {
+            if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) && _physicalDevice.getSurfaceSupportKHR(qfpIndex, _surface))
+            {
+                queueIndex = qfpIndex;
+                break;
+            }
+        }
 
-        auto graphicsQueueFamilyProperty = std::ranges::find_if(queueFamilyProperties,
-        [](const auto& qfp) { return (qfp.queueFlags & vk::QueueFlagBits::eGraphics) != static_cast<vk::QueueFlags>(0); });
-
-        auto graphicsIndex = static_cast<uint32_t>(std::distance(queueFamilyProperties.begin(), graphicsQueueFamilyProperty));
+        if (queueIndex == ~0)
+            throw std::runtime_error("Could not find a queue for graphics and present -> terminating");
 
         float queuePriority = 0.5f;
         vk::DeviceQueueCreateInfo queueCreateInfo {};
-        queueCreateInfo.queueFamilyIndex = graphicsIndex;
+        queueCreateInfo.queueFamilyIndex = queueIndex;
         queueCreateInfo.queueCount = 1;
         queueCreateInfo.pQueuePriorities = &queuePriority;
 
@@ -256,7 +305,92 @@ private:
         createInfo.ppEnabledExtensionNames = requiredDeviceExtension.data();
 
         _device = _physicalDevice.createDevice(createInfo);
-        _graphicsQueue = _device.getQueue(graphicsIndex, 0);
+        _graphicsQueue = _device.getQueue(queueIndex, 0);
+    }
+
+    void CreateSwapChain()
+    {
+        vk::SurfaceCapabilitiesKHR surfaceCapabilities = _physicalDevice.getSurfaceCapabilitiesKHR(_surface);
+        _swapChainExtent = ChooseSwapExtent(surfaceCapabilities);
+        uint32_t minImageCount = ChooseSwapMinImageCount(surfaceCapabilities);
+        std::vector<vk::SurfaceFormatKHR> availableFormats = _physicalDevice.getSurfaceFormatsKHR(_surface);
+        _surfaceFormat = ChooseSwapSurfaceFormat(availableFormats);
+        std::vector<vk::PresentModeKHR> availablePresentModes = _physicalDevice.getSurfacePresentModesKHR(_surface);
+
+        vk::SwapchainCreateInfoKHR createInfo {};
+        createInfo.surface = _surface;
+        createInfo.minImageCount = minImageCount;
+        createInfo.imageFormat = _surfaceFormat.format;
+        createInfo.imageColorSpace = _surfaceFormat.colorSpace;
+        createInfo.imageExtent = _swapChainExtent;
+        createInfo.imageArrayLayers = 1;
+        createInfo.imageUsage = vk::ImageUsageFlagBits::eColorAttachment;
+        createInfo.imageSharingMode = vk::SharingMode::eExclusive;
+        createInfo.preTransform = surfaceCapabilities.currentTransform;
+        createInfo.compositeAlpha = vk::CompositeAlphaFlagBitsKHR::eOpaque;
+        createInfo.presentMode = ChoosePresentMode(availablePresentModes);
+        createInfo.clipped = true;
+
+        _swapChain = _device.createSwapchainKHR(createInfo, nullptr);
+        _swapChainImages = _device.getSwapchainImagesKHR(_swapChain);
+    }
+
+    void CreateImageViews()
+    {
+        vk::ImageViewCreateInfo createInfo {};
+        createInfo.viewType = vk::ImageViewType::e2D;
+        createInfo.format = _surfaceFormat.format;
+        createInfo.subresourceRange = { vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1 };
+
+        for (const auto& image : _swapChainImages)
+        {
+            createInfo.image = image;
+            _swapChainImageViews.emplace_back(_device.createImageView(createInfo));
+        }
+    }
+
+    vk::SurfaceFormatKHR ChooseSwapSurfaceFormat(const std::vector<vk::SurfaceFormatKHR>& availableFormats) const
+    {
+        const auto formatIt = std::ranges::find_if(availableFormats, [](const auto& format)
+        {
+            return format.format == vk::Format::eB8G8R8A8Srgb && format.colorSpace == vk::ColorSpaceKHR::eSrgbNonlinear;
+        });
+
+        return formatIt != availableFormats.end() ? *formatIt : availableFormats.front();
+    }
+
+    vk::PresentModeKHR ChoosePresentMode(const std::vector<vk::PresentModeKHR>& availablePresentModes) const
+    {
+        return std::ranges::any_of(availablePresentModes, [](const auto& mode)
+        {
+            return mode == vk::PresentModeKHR::eMailbox;
+
+        }) ? vk::PresentModeKHR::eMailbox : vk::PresentModeKHR::eFifo;
+    }
+
+    vk::Extent2D ChooseSwapExtent(const vk::SurfaceCapabilitiesKHR& capabilities)
+    {
+        if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max())
+            return capabilities.currentExtent;
+
+        int width, height;
+        glfwGetFramebufferSize(_window, &width, &height);
+
+        return
+        {
+            std::clamp<uint32_t>(width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
+            std::clamp<uint32_t>(height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height)
+        };
+    }
+
+    uint32_t ChooseSwapMinImageCount(const vk::SurfaceCapabilitiesKHR& capabilities)
+    {
+        uint32_t minImageCount = std::max(3u, capabilities.minImageCount);
+        if ((0 < capabilities.maxImageCount) && (capabilities.maxImageCount < minImageCount))
+        {
+            minImageCount = capabilities.maxImageCount;
+        }
+        return minImageCount;
     }
 
     std::vector<const char*> GetRequiredInstanceExtensions() const
@@ -267,6 +401,10 @@ private:
         std::vector extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
         if (enableValidationLayers)
             extensions.push_back(vk::EXTDebugUtilsExtensionName);
+
+#ifdef __MACH__
+        extensions.push_back(vk::KHRPortabilityEnumerationExtensionName);
+#endif
 
         return extensions;
     }
