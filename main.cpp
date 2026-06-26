@@ -2,6 +2,7 @@
 #define VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
 
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
+#include <fstream>
 #include <vulkan/vulkan.hpp>
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -74,6 +75,11 @@ private:
     std::vector<vk::Image> _swapChainImages {};
     std::vector<vk::ImageView> _swapChainImageViews {};
 
+    vk::ShaderModule _shaderModule;
+    vk::Pipeline _pipeline;
+    vk::PipelineLayout _pipelineLayout {};
+
+
 private:
 
     void InitWindow()
@@ -95,6 +101,7 @@ private:
         CreateLogicalDevice();
         CreateSwapChain();
         CreateImageViews();
+        CreateGraphicsPipeline();
     }
 
     void MainLoop()
@@ -109,6 +116,10 @@ private:
     {
         if (enableValidationLayers)
             _instance.destroyDebugUtilsMessengerEXT(_debugMessenger);
+
+        _device.destroyPipelineLayout(_pipelineLayout);
+        _device.destroyShaderModule(_shaderModule);
+        _device.destroyPipeline(_pipeline);
 
         _device.destroySwapchainKHR(_swapChain);
 
@@ -349,6 +360,93 @@ private:
         }
     }
 
+    void CreateGraphicsPipeline()
+    {
+        _shaderModule = CreateShaderModule(ReadFile("slang.spv"));
+
+        vk::PipelineShaderStageCreateInfo vertShaderInfo {};
+        vertShaderInfo.stage = vk::ShaderStageFlagBits::eVertex;
+        vertShaderInfo.module = _shaderModule;
+        vertShaderInfo.pName = "vertMain";
+
+        vk::PipelineShaderStageCreateInfo fragShaderInfo {};
+        fragShaderInfo.stage = vk::ShaderStageFlagBits::eFragment;
+        fragShaderInfo.module = _shaderModule;
+        fragShaderInfo.pName = "fragMain";
+
+        vk::PipelineShaderStageCreateInfo shaderStages[] = { vertShaderInfo, fragShaderInfo };
+
+        std::vector<vk::DynamicState> dynamicStates = { vk::DynamicState::eViewport, vk::DynamicState::eScissor };
+        vk::PipelineDynamicStateCreateInfo dynamicStateCreateInfo {};
+        dynamicStateCreateInfo.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+        dynamicStateCreateInfo.pDynamicStates = dynamicStates.data();
+        vk::PipelineViewportStateCreateInfo viewportStateCreateInfo {};
+        viewportStateCreateInfo.viewportCount = 1;
+        viewportStateCreateInfo.scissorCount = 1;
+
+        vk::PipelineVertexInputStateCreateInfo vertexInputInfo {};
+
+        vk::PipelineInputAssemblyStateCreateInfo inputAssembly {};
+        inputAssembly.topology = vk::PrimitiveTopology::eTriangleList;
+
+        vk::PipelineRasterizationStateCreateInfo rasterizerCreateInfo {};
+        rasterizerCreateInfo.depthClampEnable = vk::False;
+        rasterizerCreateInfo.rasterizerDiscardEnable = vk::False;
+        rasterizerCreateInfo.polygonMode = vk::PolygonMode::eFill;
+        rasterizerCreateInfo.cullMode = vk::CullModeFlagBits::eBack;
+        rasterizerCreateInfo.frontFace = vk::FrontFace::eClockwise;
+        rasterizerCreateInfo.depthBiasEnable = vk::False;
+        rasterizerCreateInfo.lineWidth = 1.0f;
+
+        vk::PipelineMultisampleStateCreateInfo multisampling {};
+        multisampling.rasterizationSamples = vk::SampleCountFlagBits::e1;
+        multisampling.sampleShadingEnable = vk::False;
+
+        vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+            .blendEnable    = vk::False,
+            .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+
+        vk::PipelineColorBlendStateCreateInfo colorBlending{
+            .logicOpEnable = vk::False, .logicOp = vk::LogicOp::eCopy, .attachmentCount = 1, .pAttachments = &colorBlendAttachment};
+
+        vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo {};
+        pipelineLayoutCreateInfo.setLayoutCount = 0;
+        pipelineLayoutCreateInfo.pushConstantRangeCount = 0;
+        _pipelineLayout = _device.createPipelineLayout(pipelineLayoutCreateInfo);
+
+        vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo {};
+        pipelineRenderingCreateInfo.colorAttachmentCount = 1;
+        pipelineRenderingCreateInfo.pColorAttachmentFormats = &_surfaceFormat.format;
+
+        vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> createInfoChain = {
+            {
+                  .stageCount = 2,
+                  .pStages = shaderStages,
+                  .pVertexInputState = &vertexInputInfo,
+                  .pInputAssemblyState = &inputAssembly,
+                  .pViewportState = &viewportStateCreateInfo,
+                  .pRasterizationState = &rasterizerCreateInfo,
+                  .pMultisampleState = &multisampling,
+                  .pColorBlendState = &colorBlending,
+                  .pDynamicState = &dynamicStateCreateInfo,
+                  .layout = _pipelineLayout,
+                  .renderPass = nullptr
+                },
+        { .colorAttachmentCount = 1, .pColorAttachmentFormats = &_surfaceFormat.format }
+        };
+
+        _pipeline = _device.createGraphicsPipeline(nullptr, createInfoChain.get<vk::GraphicsPipelineCreateInfo>()).value;
+    }
+
+    vk::ShaderModule CreateShaderModule(const std::vector<char>& code) const
+    {
+        vk::ShaderModuleCreateInfo createInfo {};
+        createInfo.codeSize = code.size() * sizeof(char);
+        createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+        return _device.createShaderModule(createInfo);
+    }
+
     vk::SurfaceFormatKHR ChooseSwapSurfaceFormat(const std::vector<vk::SurfaceFormatKHR>& availableFormats) const
     {
         const auto formatIt = std::ranges::find_if(availableFormats, [](const auto& format)
@@ -407,6 +505,22 @@ private:
 #endif
 
         return extensions;
+    }
+
+    static std::vector<char> ReadFile(const std::string& filename)
+    {
+        std::ifstream file(filename, std::ios::ate | std::ios::binary);
+
+        if (!file.is_open())
+            throw std::runtime_error("failed to open a file");
+
+        std::vector<char> buffer(file.tellg());
+        file.seekg(0, std::ios::beg);
+        file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+
+        file.close();
+
+        return buffer;
     }
 
 };
