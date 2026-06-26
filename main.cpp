@@ -64,6 +64,7 @@ private:
     vk::PhysicalDevice _physicalDevice {};
 
     vk::Device _device {};
+    uint32_t _queueIndex = ~0;
 
     vk::Queue _graphicsQueue {};
 
@@ -79,6 +80,8 @@ private:
     vk::Pipeline _pipeline;
     vk::PipelineLayout _pipelineLayout {};
 
+    vk::CommandPool _commandPool {};
+    vk::CommandBuffer _commandBuffer;
 
 private:
 
@@ -102,6 +105,8 @@ private:
         CreateSwapChain();
         CreateImageViews();
         CreateGraphicsPipeline();
+        CreateCommandPool();
+        CreateCommandBuffer();
     }
 
     void MainLoop()
@@ -127,6 +132,10 @@ private:
             _device.destroyImageView(imageView);
 
         vkDestroySurfaceKHR(_instance, _surface, nullptr);
+
+        _device.freeCommandBuffers(_commandPool, _commandBuffer);
+        _device.destroyCommandPool(_commandPool);
+
         _device.destroy();
         _instance.destroy();
 
@@ -278,22 +287,22 @@ private:
     void CreateLogicalDevice()
     {
         std::vector<vk::QueueFamilyProperties> queueFamilyProperties = _physicalDevice.getQueueFamilyProperties();
-        uint32_t queueIndex = ~0;
+
         for (uint32_t qfpIndex = 0; qfpIndex < queueFamilyProperties.size(); ++qfpIndex)
         {
             if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) && _physicalDevice.getSurfaceSupportKHR(qfpIndex, _surface))
             {
-                queueIndex = qfpIndex;
+                _queueIndex = qfpIndex;
                 break;
             }
         }
 
-        if (queueIndex == ~0)
+        if (_queueIndex == ~0)
             throw std::runtime_error("Could not find a queue for graphics and present -> terminating");
 
         float queuePriority = 0.5f;
         vk::DeviceQueueCreateInfo queueCreateInfo {};
-        queueCreateInfo.queueFamilyIndex = queueIndex;
+        queueCreateInfo.queueFamilyIndex = _queueIndex;
         queueCreateInfo.queueCount = 1;
         queueCreateInfo.pQueuePriorities = &queuePriority;
 
@@ -316,7 +325,7 @@ private:
         createInfo.ppEnabledExtensionNames = requiredDeviceExtension.data();
 
         _device = _physicalDevice.createDevice(createInfo);
-        _graphicsQueue = _device.getQueue(queueIndex, 0);
+        _graphicsQueue = _device.getQueue(_queueIndex, 0);
     }
 
     void CreateSwapChain()
@@ -436,6 +445,111 @@ private:
         };
 
         _pipeline = _device.createGraphicsPipeline(nullptr, createInfoChain.get<vk::GraphicsPipelineCreateInfo>()).value;
+    }
+
+    void CreateCommandPool()
+    {
+        vk::CommandPoolCreateInfo createInfo {};
+        createInfo.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+        createInfo.queueFamilyIndex = _queueIndex;
+
+        _commandPool = _device.createCommandPool(createInfo);
+    }
+
+    void CreateCommandBuffer()
+    {
+        vk::CommandBufferAllocateInfo allocInfo {};
+        allocInfo.commandPool = _commandPool;
+        allocInfo.level = vk::CommandBufferLevel::ePrimary;
+        allocInfo.commandBufferCount = 1;
+
+        _commandBuffer = _device.allocateCommandBuffers(allocInfo).front();
+    }
+
+    void RecordCommandBuffer(uint32_t imageIndex)
+    {
+        TransitImageLayout(
+            imageIndex,
+            vk::ImageLayout::eUndefined,
+            vk::ImageLayout::eColorAttachmentOptimal,
+    {},
+    vk::AccessFlagBits2::eColorAttachmentWrite,
+    vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+    vk::PipelineStageFlagBits2::eColorAttachmentOutput
+        );
+
+        vk::ClearValue clearColor = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f);
+        vk::RenderingAttachmentInfo attachmentInfo {};
+        attachmentInfo.imageView = _swapChainImageViews[imageIndex];
+        attachmentInfo.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+        attachmentInfo.loadOp = vk::AttachmentLoadOp::eClear;
+        attachmentInfo.storeOp = vk::AttachmentStoreOp::eStore;
+        attachmentInfo.clearValue = clearColor;
+
+        vk::RenderingInfo renderingInfo {};
+        renderingInfo.renderArea.offset = {0, 0};
+        renderingInfo.renderArea.extent = _swapChainExtent;
+        renderingInfo.layerCount = 1;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachments = &attachmentInfo;
+
+        _commandBuffer.beginRendering(renderingInfo);
+        _commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, _pipeline);
+
+        _commandBuffer.setViewport(0, vk::Viewport(0.0, 0.0, static_cast<float>(_swapChainExtent.width), static_cast<float>(_swapChainExtent.height), 0.0f, 1.0f));
+        _commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), _swapChainExtent));
+
+        _commandBuffer.draw(3, 1, 0, 0);
+
+        _commandBuffer.endRendering();
+
+        TransitImageLayout(
+            imageIndex,
+            vk::ImageLayout::eColorAttachmentOptimal,
+            vk::ImageLayout::ePresentSrcKHR,
+            vk::AccessFlagBits2::eColorAttachmentWrite,
+            {},
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::PipelineStageFlagBits2::eBottomOfPipe
+        );
+
+        _commandBuffer.end();
+    }
+
+    void TransitImageLayout(uint32_t imageIndex,
+        vk::ImageLayout         oldLayout,
+        vk::ImageLayout         newLayout,
+        vk::AccessFlags2        srcAccessMask,
+        vk::AccessFlags2        dstAccessMask,
+        vk::PipelineStageFlags2 srcStageMask,
+        vk::PipelineStageFlags2 dstStageMask)
+    {
+        vk::ImageMemoryBarrier2 barrier =
+        {
+            .srcStageMask        = srcStageMask,
+            .srcAccessMask       = srcAccessMask,
+            .dstStageMask        = dstStageMask,
+            .dstAccessMask       = dstAccessMask,
+            .oldLayout           = oldLayout,
+            .newLayout           = newLayout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image               = _swapChainImages[imageIndex],
+            .subresourceRange    =
+         {
+                .aspectMask      = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel    = 0,
+                .levelCount      = 1,
+                .baseArrayLayer  = 0,
+                .layerCount      = 1
+            }
+        };
+        vk::DependencyInfo dependencyInfo = {
+            .dependencyFlags         = {},
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers    = &barrier};
+
+        _commandBuffer.pipelineBarrier2(dependencyInfo);
     }
 
     vk::ShaderModule CreateShaderModule(const std::vector<char>& code) const
