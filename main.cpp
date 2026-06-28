@@ -38,6 +38,8 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(vk::DebugUtilsMessageSever
     return vk::False;
 }
 
+constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+
 class HelloTriangleApplication
 {
 
@@ -81,11 +83,13 @@ private:
     vk::PipelineLayout _pipelineLayout {};
 
     vk::CommandPool _commandPool {};
-    vk::CommandBuffer _commandBuffer;
+    std::vector<vk::CommandBuffer> _commandBuffers;
 
-    vk::Semaphore _presentCompleteSemaphore {};
-    vk::Semaphore _renderFinishedSemaphore {};
-    vk::Fence _drawFence {};
+    std::vector<vk::Semaphore> _presentCompleteSemaphores {};
+    std::vector<vk::Semaphore> _renderFinishedSemaphores {};
+    std::vector<vk::Fence> _drawFences {};
+
+    uint32_t _frameIndex = 0;
 
 private:
 
@@ -110,7 +114,7 @@ private:
         CreateImageViews();
         CreateGraphicsPipeline();
         CreateCommandPool();
-        CreateCommandBuffer();
+        CreateCommandBuffers();
         CreateSyncObjects();
     }
 
@@ -127,13 +131,13 @@ private:
 
     void DrawFrame()
     {
-        auto fenceResult = _device.waitForFences(_drawFence, vk::True, UINT64_MAX);
+        auto fenceResult = _device.waitForFences(_drawFences[_frameIndex], vk::True, UINT64_MAX);
         if (fenceResult != vk::Result::eSuccess)
             throw std::runtime_error("failed to wait for fence");
 
-        _device.resetFences(_drawFence);
+        _device.resetFences(_drawFences[_frameIndex]);
 
-        auto imageAcquisition = _device.acquireNextImageKHR(_swapChain, UINT64_MAX, _presentCompleteSemaphore);
+        auto imageAcquisition = _device.acquireNextImageKHR(_swapChain, UINT64_MAX, _presentCompleteSemaphores[_frameIndex]);
         if (imageAcquisition.result != vk::Result::eSuccess)
             throw std::runtime_error("failed to acquire image from swapchain");
 
@@ -145,19 +149,19 @@ private:
 
         vk::SubmitInfo submitInfo {};
         submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &_presentCompleteSemaphore;
+        submitInfo.pWaitSemaphores = &_presentCompleteSemaphores[_frameIndex];
         submitInfo.pWaitDstStageMask = &waitDestinationStageMask;
         submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &_commandBuffer;
+        submitInfo.pCommandBuffers = &_commandBuffers[_frameIndex];
         submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &_renderFinishedSemaphore;
+        submitInfo.pSignalSemaphores = &_renderFinishedSemaphores[imageIndex];
 
         _queue.waitIdle();
-        _queue.submit(submitInfo, _drawFence);
+        _queue.submit(submitInfo, _drawFences[_frameIndex]);
 
         vk::PresentInfoKHR presentInfo {};
         presentInfo.waitSemaphoreCount = 1;
-        presentInfo.pWaitSemaphores = &_renderFinishedSemaphore;
+        presentInfo.pWaitSemaphores = &_renderFinishedSemaphores[imageIndex];
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = &_swapChain;
         presentInfo.pImageIndices = &imageIndex;
@@ -184,12 +188,19 @@ private:
 
         vkDestroySurfaceKHR(_instance, _surface, nullptr);
 
-        _device.freeCommandBuffers(_commandPool, _commandBuffer);
+        for (auto _commandBuffer : _commandBuffers)
+            _device.freeCommandBuffers(_commandPool, _commandBuffer);
+
         _device.destroyCommandPool(_commandPool);
 
-        _device.destroySemaphore(_presentCompleteSemaphore);
-        _device.destroySemaphore(_renderFinishedSemaphore);
-        _device.destroyFence(_drawFence);
+        for (auto& _presentCompleteSemaphore : _presentCompleteSemaphores)
+            _device.destroySemaphore(_presentCompleteSemaphore);
+
+        for (auto _renderFinishedSemaphore : _renderFinishedSemaphores)
+            _device.destroySemaphore(_renderFinishedSemaphore);
+
+        for (auto _drawFence : _drawFences)
+            _device.destroyFence(_drawFence);
 
         _device.destroy();
         _instance.destroy();
@@ -512,30 +523,34 @@ private:
         _commandPool = _device.createCommandPool(createInfo);
     }
 
-    void CreateCommandBuffer()
+    void CreateCommandBuffers()
     {
         vk::CommandBufferAllocateInfo allocInfo {};
         allocInfo.commandPool = _commandPool;
         allocInfo.level = vk::CommandBufferLevel::ePrimary;
-        allocInfo.commandBufferCount = 1;
+        allocInfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
 
-        _commandBuffer = _device.allocateCommandBuffers(allocInfo).front();
+        _commandBuffers = _device.allocateCommandBuffers(allocInfo);
     }
 
     void CreateSyncObjects()
     {
-        _presentCompleteSemaphore = _device.createSemaphore(vk::SemaphoreCreateInfo());
-        _renderFinishedSemaphore = _device.createSemaphore(vk::SemaphoreCreateInfo());
+        for (int i = 0; i < _swapChainImages.size(); ++i)
+            _renderFinishedSemaphores.emplace_back(_device.createSemaphore(vk::SemaphoreCreateInfo()));
 
-        vk::FenceCreateInfo fenceCreateInfo {};
-        fenceCreateInfo.flags = vk::FenceCreateFlagBits::eSignaled;
-        _drawFence = _device.createFence(fenceCreateInfo);
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+        {
+            _presentCompleteSemaphores.emplace_back(_device.createSemaphore(vk::SemaphoreCreateInfo()));
+            vk::FenceCreateInfo fenceCreateInfo {};
+            fenceCreateInfo.flags = vk::FenceCreateFlagBits::eSignaled;
+            _drawFences.emplace_back(_device.createFence(fenceCreateInfo));
+        }
     }
 
     void RecordCommandBuffer(uint32_t imageIndex)
     {
         vk::CommandBufferBeginInfo beginInfo {};
-        _commandBuffer.begin(beginInfo);
+        _commandBuffers[_frameIndex].begin(beginInfo);
 
         TransitImageLayout(
             imageIndex,
@@ -562,15 +577,15 @@ private:
         renderingInfo.colorAttachmentCount = 1;
         renderingInfo.pColorAttachments = &attachmentInfo;
 
-        _commandBuffer.beginRendering(renderingInfo);
-        _commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, _pipeline);
+        _commandBuffers[_frameIndex].beginRendering(renderingInfo);
+        _commandBuffers[_frameIndex].bindPipeline(vk::PipelineBindPoint::eGraphics, _pipeline);
 
-        _commandBuffer.setViewport(0, vk::Viewport(0.0, 0.0, static_cast<float>(_swapChainExtent.width), static_cast<float>(_swapChainExtent.height), 0.0f, 1.0f));
-        _commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), _swapChainExtent));
+        _commandBuffers[_frameIndex].setViewport(0, vk::Viewport(0.0, 0.0, static_cast<float>(_swapChainExtent.width), static_cast<float>(_swapChainExtent.height), 0.0f, 1.0f));
+        _commandBuffers[_frameIndex].setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), _swapChainExtent));
 
-        _commandBuffer.draw(3, 1, 0, 0);
+        _commandBuffers[_frameIndex].draw(3, 1, 0, 0);
 
-        _commandBuffer.endRendering();
+        _commandBuffers[_frameIndex].endRendering();
 
         TransitImageLayout(
             imageIndex,
@@ -582,7 +597,7 @@ private:
             vk::PipelineStageFlagBits2::eBottomOfPipe
         );
 
-        _commandBuffer.end();
+        _commandBuffers[_frameIndex].end();
     }
 
     void TransitImageLayout(uint32_t imageIndex,
@@ -618,7 +633,7 @@ private:
             .imageMemoryBarrierCount = 1,
             .pImageMemoryBarriers    = &barrier};
 
-        _commandBuffer.pipelineBarrier2(dependencyInfo);
+        _commandBuffers[_frameIndex].pipelineBarrier2(dependencyInfo);
     }
 
     vk::ShaderModule CreateShaderModule(const std::vector<char>& code) const
