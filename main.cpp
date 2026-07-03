@@ -1,4 +1,5 @@
 #include <iostream>
+
 #define VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
 
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
@@ -62,9 +63,14 @@ struct Vertex
 };
 
 const std::vector<Vertex> vertices = {
-    {{0.0f, -0.5f}, {1.0f, 1.0f, 1.0f}},
-    {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}}
+    { {0.5f, -0.5f}, {1.0f, 0.0f, 0.0f} },
+    { {-0.5f, -0.5f}, {0.0f, 1.0f, 0.0f} },
+    { {-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f} },
+    { {0.5f, 0.5f}, {1.0f, 1.0f, 1.0f} }
+};
+
+const std::vector<uint16_t> indices = {
+    0, 1, 2, 2, 3, 0
 };
 
 class HelloTriangleApplication
@@ -132,6 +138,9 @@ private:
     vk::Buffer _vertexBuffer {};
     vk::DeviceMemory _vertexBufferMemory {};
 
+    vk::Buffer _indexBuffer {};
+    vk::DeviceMemory _indexBufferMemory {};
+
 private:
 
     void InitWindow()
@@ -165,6 +174,7 @@ private:
         CreateGraphicsCommandPool();
         CreateTransferCommandPool();
         CreateVertexBuffer();
+        CreateIndexBuffer();
         CreateCommandBuffers();
         CreateSyncObjects();
     }
@@ -216,7 +226,6 @@ private:
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = &_renderFinishedSemaphores[imageIndex];
 
-        _graphicsQueue.waitIdle();
         _graphicsQueue.submit(submitInfo, _drawFences[_frameIndex]);
 
         vk::PresentInfoKHR presentInfo {};
@@ -226,10 +235,22 @@ private:
         presentInfo.pSwapchains = &_swapChain;
         presentInfo.pImageIndices = &imageIndex;
 
-        auto result = _graphicsQueue.presentKHR(presentInfo);
+        try
+        {
+            auto result = _graphicsQueue.presentKHR(presentInfo);
 
-        if (result == vk::Result::eSuboptimalKHR || result == vk::Result::eErrorOutOfDateKHR || _framebufferResized)
+            if (result == vk::Result::eSuboptimalKHR ||  _framebufferResized)
+            {
+                _framebufferResized = false;
+                RecreateSwapChain();
+            }
+        } catch (const vk::OutOfDateKHRError& error)
+        {
+            _framebufferResized = false;
             RecreateSwapChain();
+        }
+
+        _frameIndex = (_frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
     void Cleanup()
@@ -243,6 +264,9 @@ private:
 
         _device.destroyBuffer(_vertexBuffer);
         _device.freeMemory(_vertexBufferMemory);
+
+        _device.destroyBuffer(_indexBuffer);
+        _device.freeMemory(_indexBufferMemory);
 
         CleanupSwapChain();
 
@@ -660,6 +684,24 @@ private:
         _device.freeMemory(stagingBufferMemory);
     }
 
+    void CreateIndexBuffer()
+    {
+        vk::DeviceSize size = sizeof(indices[0]) * indices.size();
+
+        auto [stagingBuffer, stagingBufferMemory] = CreateBuffer(size, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostVisible);
+
+        void* dataStaging = _device.mapMemory(stagingBufferMemory, 0, size);
+        memcpy(dataStaging, indices.data(), size);
+        _device.unmapMemory(stagingBufferMemory);
+
+        std::tie(_indexBuffer, _indexBufferMemory) = CreateBuffer(size, vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+        CopyBuffer(stagingBuffer, _indexBuffer, size);
+
+        _device.destroyBuffer(stagingBuffer);
+        _device.freeMemory(stagingBufferMemory);
+    }
+
     void CopyBuffer(const vk::Buffer& src, const vk::Buffer& dst, vk::DeviceSize size)
     {
         vk::CommandBufferAllocateInfo allocInfo{ .commandPool = _transferCommandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1 };
@@ -789,11 +831,12 @@ private:
         _commandBuffers[_frameIndex].bindPipeline(vk::PipelineBindPoint::eGraphics, _pipeline);
 
         _commandBuffers[_frameIndex].bindVertexBuffers(0, _vertexBuffer, {0});
+        _commandBuffers[_frameIndex].bindIndexBuffer(_indexBuffer, 0, vk::IndexType::eUint16);
 
         _commandBuffers[_frameIndex].setViewport(0, vk::Viewport(0.0, 0.0, static_cast<float>(_swapChainExtent.width), static_cast<float>(_swapChainExtent.height), 0.0f, 1.0f));
         _commandBuffers[_frameIndex].setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), _swapChainExtent));
 
-        _commandBuffers[_frameIndex].draw(vertices.size(), 1, 0, 0);
+        _commandBuffers[_frameIndex].drawIndexed(indices.size(), 1, 0, 0, 0);
 
         _commandBuffers[_frameIndex].endRendering();
 
