@@ -9,6 +9,8 @@
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <chrono>
 
 #include <GLFW/glfw3.h>
 
@@ -47,6 +49,7 @@ constexpr int MAX_FRAMES_IN_FLIGHT = 2;
 struct Vertex
 {
     glm::vec2 position;
+
     glm::vec3 color;
 
     static vk::VertexInputBindingDescription GetBindingDescription()
@@ -62,6 +65,15 @@ struct Vertex
 
 };
 
+struct UniformBufferObject
+{
+    glm::mat4 model;
+
+    glm::mat4 view;
+
+    glm::mat4 projection;
+};
+
 const std::vector<Vertex> vertices = {
     { {0.5f, -0.5f}, {1.0f, 0.0f, 0.0f} },
     { {-0.5f, -0.5f}, {0.0f, 1.0f, 0.0f} },
@@ -70,7 +82,7 @@ const std::vector<Vertex> vertices = {
 };
 
 const std::vector<uint16_t> indices = {
-    0, 1, 2, 2, 3, 0
+    0, 2, 1, 2, 0, 3
 };
 
 class HelloTriangleApplication
@@ -121,6 +133,11 @@ private:
 
     vk::ShaderModule _shaderModule;
     vk::Pipeline _pipeline;
+
+    vk::DescriptorPool _descriptorPool {};
+    vk::DescriptorSetLayout _descriptorSetLayout {};
+    std::vector<vk::DescriptorSet> _descriptorSets;
+
     vk::PipelineLayout _pipelineLayout {};
 
     vk::CommandPool _graphicsCommandPool {};
@@ -140,6 +157,10 @@ private:
 
     vk::Buffer _indexBuffer {};
     vk::DeviceMemory _indexBufferMemory {};
+
+    std::vector<vk::Buffer> _uniformBuffers;
+    std::vector<vk::DeviceMemory> _uniformBufferMemory;
+    std::vector<void*> _uniformBuffersMapped;
 
 private:
 
@@ -170,11 +191,15 @@ private:
         CreateLogicalDevice();
         CreateSwapChain();
         CreateImageViews();
+        CreateDescriptorSetLayout();
         CreateGraphicsPipeline();
         CreateGraphicsCommandPool();
         CreateTransferCommandPool();
         CreateVertexBuffer();
         CreateIndexBuffer();
+        CreateUniformBuffers();
+        CreateDescriptorPool();
+        CreateDescriptorSets();
         CreateCommandBuffers();
         CreateSyncObjects();
     }
@@ -217,6 +242,8 @@ private:
 
         vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
 
+        UpdateUniformBuffer(_frameIndex);
+
         vk::SubmitInfo submitInfo {};
         submitInfo.waitSemaphoreCount = 1;
         submitInfo.pWaitSemaphores = &_presentCompleteSemaphores[_frameIndex];
@@ -253,6 +280,21 @@ private:
         _frameIndex = (_frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
+    void UpdateUniformBuffer(uint32_t frameIndex)
+    {
+        static auto startTime = std::chrono::high_resolution_clock::now();
+
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+
+        UniformBufferObject ubo {};
+        ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        ubo.projection = glm::perspective(glm::radians(45.0f), static_cast<float>(_swapChainExtent.width) / static_cast<float>(_swapChainExtent.height), 0.1f, 10.0f);
+
+        memcpy(_uniformBuffersMapped[frameIndex], &ubo, sizeof(ubo));
+    }
+
     void Cleanup()
     {
         if (enableValidationLayers)
@@ -260,13 +302,28 @@ private:
 
         _device.destroyPipelineLayout(_pipelineLayout);
         _device.destroyShaderModule(_shaderModule);
+
+        _device.destroyDescriptorSetLayout(_descriptorSetLayout);
         _device.destroyPipeline(_pipeline);
 
         _device.destroyBuffer(_vertexBuffer);
         _device.freeMemory(_vertexBufferMemory);
 
+
+        _device.freeDescriptorSets(_descriptorPool, _descriptorSets.size(), _descriptorSets.data());
+        _device.destroyDescriptorPool(_descriptorPool);
+
         _device.destroyBuffer(_indexBuffer);
         _device.freeMemory(_indexBufferMemory);
+
+        for (auto uniformBuffer : _uniformBuffers)
+            _device.destroyBuffer(uniformBuffer);
+
+        for (auto bufferMemory : _uniformBufferMemory)
+        {
+            _device.unmapMemory(bufferMemory);
+            _device.freeMemory(bufferMemory);
+        }
 
         CleanupSwapChain();
 
@@ -449,7 +506,7 @@ private:
                 graphicsFound = true;
             }
 
-            if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eTransfer) && !transferFound)
+            if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eTransfer) && !(queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) && !transferFound)
             {
                 _transferQueueIndex = qfpIndex;
                 transferFound = true;
@@ -462,11 +519,19 @@ private:
         if (_graphicsQueueIndex == ~0)
             throw std::runtime_error("Could not find a queue for graphics and present -> terminating");
 
-        float queuePriority = 0.5f;
-        vk::DeviceQueueCreateInfo queueCreateInfo {};
-        queueCreateInfo.queueFamilyIndex = _graphicsQueueIndex;
-        queueCreateInfo.queueCount = 1;
-        queueCreateInfo.pQueuePriorities = &queuePriority;
+        std::set uniqueQueues = { _graphicsQueueIndex, _transferQueueIndex };
+        std::vector<vk::DeviceQueueCreateInfo> queueCreateInfos;
+
+        for (uint32_t queueFamily : uniqueQueues)
+        {
+            float queuePriority = 0.5f;
+            vk::DeviceQueueCreateInfo queueCreateInfo {};
+            queueCreateInfo.queueFamilyIndex = queueFamily;
+            queueCreateInfo.queueCount = 1;
+            queueCreateInfo.pQueuePriorities = &queuePriority;
+
+            queueCreateInfos.push_back(queueCreateInfo);
+        }
 
         vk::StructureChain<vk::PhysicalDeviceFeatures2,
                            vk::PhysicalDeviceVulkan11Features,
@@ -481,8 +546,8 @@ private:
 
         vk::DeviceCreateInfo createInfo {};
         createInfo.pNext = &featureChain.get<vk::PhysicalDeviceFeatures2>();
-        createInfo.queueCreateInfoCount = 1;
-        createInfo.pQueueCreateInfos = &queueCreateInfo;
+        createInfo.queueCreateInfoCount = queueCreateInfos.size();
+        createInfo.pQueueCreateInfos = queueCreateInfos.data();
         createInfo.enabledExtensionCount = static_cast<uint32_t>(requiredDeviceExtension.size());
         createInfo.ppEnabledExtensionNames = requiredDeviceExtension.data();
 
@@ -564,6 +629,21 @@ private:
         }
     }
 
+    void CreateDescriptorSetLayout()
+    {
+        vk::DescriptorSetLayoutBinding uboLayoutBinding {};
+        uboLayoutBinding.binding = 0;
+        uboLayoutBinding.descriptorType = vk::DescriptorType::eUniformBuffer;
+        uboLayoutBinding.descriptorCount = 1;
+        uboLayoutBinding.stageFlags = vk::ShaderStageFlagBits::eVertex;
+
+        vk::DescriptorSetLayoutCreateInfo createInfo {};
+        createInfo.bindingCount = 1;
+        createInfo.pBindings = &uboLayoutBinding;
+
+        _descriptorSetLayout = _device.createDescriptorSetLayout(createInfo);
+    }
+
     void CreateGraphicsPipeline()
     {
         _shaderModule = CreateShaderModule(ReadFile("slang.spv"));
@@ -620,7 +700,8 @@ private:
             .logicOpEnable = vk::False, .logicOp = vk::LogicOp::eCopy, .attachmentCount = 1, .pAttachments = &colorBlendAttachment};
 
         vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo {};
-        pipelineLayoutCreateInfo.setLayoutCount = 0;
+        pipelineLayoutCreateInfo.setLayoutCount = 1;
+        pipelineLayoutCreateInfo.pSetLayouts = &_descriptorSetLayout;
         pipelineLayoutCreateInfo.pushConstantRangeCount = 0;
         _pipelineLayout = _device.createPipelineLayout(pipelineLayoutCreateInfo);
 
@@ -702,7 +783,65 @@ private:
         _device.freeMemory(stagingBufferMemory);
     }
 
-    void CopyBuffer(const vk::Buffer& src, const vk::Buffer& dst, vk::DeviceSize size)
+    void CreateUniformBuffers()
+    {
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+        {
+            vk::DeviceSize bufferSize = sizeof(UniformBufferObject);
+            auto [buffer, bufferMemory] = CreateBuffer(bufferSize, vk::BufferUsageFlagBits::eUniformBuffer, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+
+            _uniformBuffers.push_back(buffer);
+            _uniformBufferMemory.push_back(bufferMemory);
+            _uniformBuffersMapped.push_back(_device.mapMemory(_uniformBufferMemory.back(), 0, bufferSize));
+        }
+    }
+
+    void CreateDescriptorPool()
+    {
+        vk::DescriptorPoolSize poolSize {};
+        poolSize.type = vk::DescriptorType::eUniformBuffer;
+        poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+        vk::DescriptorPoolCreateInfo createInfo {};
+        createInfo.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
+        createInfo.maxSets = MAX_FRAMES_IN_FLIGHT;
+        createInfo.poolSizeCount = 1;
+        createInfo.pPoolSizes = &poolSize;
+
+        _descriptorPool = _device.createDescriptorPool(createInfo);
+    }
+
+    void CreateDescriptorSets()
+    {
+        std::vector<vk::DescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, _descriptorSetLayout);
+
+        vk::DescriptorSetAllocateInfo allocInfo {};
+        allocInfo.descriptorPool = _descriptorPool;
+        allocInfo.descriptorSetCount = MAX_FRAMES_IN_FLIGHT;
+        allocInfo.pSetLayouts = layouts.data();
+
+        _descriptorSets = _device.allocateDescriptorSets(allocInfo);
+
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+        {
+            vk::DescriptorBufferInfo bufferInfo {};
+            bufferInfo.buffer = _uniformBuffers[i];
+            bufferInfo.offset = 0;
+            bufferInfo.range = sizeof(UniformBufferObject);
+
+            vk::WriteDescriptorSet descriptorWrite {};
+            descriptorWrite.dstSet = _descriptorSets[i];
+            descriptorWrite.dstBinding = 0;
+            descriptorWrite.dstArrayElement = 0;
+            descriptorWrite.descriptorCount = 1;
+            descriptorWrite.descriptorType = vk::DescriptorType::eUniformBuffer;
+            descriptorWrite.pBufferInfo = &bufferInfo;
+
+            _device.updateDescriptorSets(descriptorWrite, {});
+        }
+    }
+
+    void CopyBuffer(const vk::Buffer& src, const vk::Buffer& dst, vk::DeviceSize size) const
     {
         vk::CommandBufferAllocateInfo allocInfo{ .commandPool = _transferCommandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1 };
         vk::CommandBuffer commandCopyBuffer = _device.allocateCommandBuffers(allocInfo).front();
@@ -758,7 +897,7 @@ private:
         return { buffer, memory };
     }
 
-    uint32_t FindMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties)
+    uint32_t FindMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties) const
     {
         vk::PhysicalDeviceMemoryProperties memProperties = _physicalDevice.getMemoryProperties();
 
@@ -797,7 +936,7 @@ private:
         }
     }
 
-    void RecordCommandBuffer(uint32_t imageIndex)
+    void RecordCommandBuffer(uint32_t imageIndex) const
     {
         vk::CommandBufferBeginInfo beginInfo {};
         _commandBuffers[_frameIndex].begin(beginInfo);
@@ -833,9 +972,10 @@ private:
         _commandBuffers[_frameIndex].bindVertexBuffers(0, _vertexBuffer, {0});
         _commandBuffers[_frameIndex].bindIndexBuffer(_indexBuffer, 0, vk::IndexType::eUint16);
 
-        _commandBuffers[_frameIndex].setViewport(0, vk::Viewport(0.0, 0.0, static_cast<float>(_swapChainExtent.width), static_cast<float>(_swapChainExtent.height), 0.0f, 1.0f));
+        _commandBuffers[_frameIndex].setViewport(0, vk::Viewport(0.0, static_cast<float>(_swapChainExtent.height), static_cast<float>(_swapChainExtent.width), -static_cast<float>(_swapChainExtent.height), 0.0f, 1.0f));
         _commandBuffers[_frameIndex].setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), _swapChainExtent));
 
+        _commandBuffers[_frameIndex].bindDescriptorSets(vk::PipelineBindPoint::eGraphics, _pipelineLayout, 0, _descriptorSets[_frameIndex], nullptr);
         _commandBuffers[_frameIndex].drawIndexed(indices.size(), 1, 0, 0, 0);
 
         _commandBuffers[_frameIndex].endRendering();
@@ -917,7 +1057,7 @@ private:
         }) ? vk::PresentModeKHR::eMailbox : vk::PresentModeKHR::eFifo;
     }
 
-    vk::Extent2D ChooseSwapExtent(const vk::SurfaceCapabilitiesKHR& capabilities)
+    vk::Extent2D ChooseSwapExtent(const vk::SurfaceCapabilitiesKHR& capabilities) const
     {
         if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max())
             return capabilities.currentExtent;
