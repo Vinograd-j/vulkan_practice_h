@@ -14,6 +14,9 @@ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 #include <GLFW/glfw3.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 
@@ -82,7 +85,7 @@ const std::vector<Vertex> vertices = {
 };
 
 const std::vector<uint16_t> indices = {
-    0, 2, 1, 2, 0, 3
+    1, 0, 2, 0, 3, 2
 };
 
 class HelloTriangleApplication
@@ -162,6 +165,11 @@ private:
     std::vector<vk::DeviceMemory> _uniformBufferMemory;
     std::vector<void*> _uniformBuffersMapped;
 
+    vk::Image _textureImage {};
+    vk::ImageView _textureImageView {};
+    vk::DeviceMemory _textureImageMemory {};
+    vk::Sampler _textureSampler {};
+
 private:
 
     void InitWindow()
@@ -195,6 +203,9 @@ private:
         CreateGraphicsPipeline();
         CreateGraphicsCommandPool();
         CreateTransferCommandPool();
+        CreateTextureImage();
+        CreateTextureImageView();
+        CreateTextureSampler();
         CreateVertexBuffer();
         CreateIndexBuffer();
         CreateUniformBuffers();
@@ -309,7 +320,6 @@ private:
         _device.destroyBuffer(_vertexBuffer);
         _device.freeMemory(_vertexBufferMemory);
 
-
         _device.freeDescriptorSets(_descriptorPool, _descriptorSets.size(), _descriptorSets.data());
         _device.destroyDescriptorPool(_descriptorPool);
 
@@ -324,6 +334,12 @@ private:
             _device.unmapMemory(bufferMemory);
             _device.freeMemory(bufferMemory);
         }
+
+        _device.destroySampler(_textureSampler);
+        _device.destroyImageView(_textureImageView);
+        _device.destroyImage(_textureImage);
+        _device.freeMemory(_textureImageMemory);
+
 
         CleanupSwapChain();
 
@@ -468,7 +484,8 @@ private:
                                                                              vk::PhysicalDeviceVulkan13Features,
                                                                              vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
 
-        bool supportsRequiredFeatures = features.get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
+        bool supportsRequiredFeatures = features.get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy &&
+                                        features.get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
                                         features.get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
                                         features.get<vk::PhysicalDeviceVulkan13Features>().synchronization2 &&
                                         features.get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
@@ -538,7 +555,7 @@ private:
                            vk::PhysicalDeviceVulkan13Features,
                            vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>
         featureChain = {
-            {},
+            {.features = {.samplerAnisotropy = true } },
             {.shaderDrawParameters = true },
             { .synchronization2 = true, .dynamicRendering = true},
             {.extendedDynamicState = true },
@@ -617,16 +634,10 @@ private:
 
     void CreateImageViews()
     {
-        vk::ImageViewCreateInfo createInfo {};
-        createInfo.viewType = vk::ImageViewType::e2D;
-        createInfo.format = _surfaceFormat.format;
-        createInfo.subresourceRange = { vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1 };
+        _swapChainImageViews.reserve(_swapChainImages.size());
 
         for (const auto& image : _swapChainImages)
-        {
-            createInfo.image = image;
-            _swapChainImageViews.emplace_back(_device.createImageView(createInfo));
-        }
+            _swapChainImageViews.emplace_back(CreateImageView(image, _surfaceFormat.format));
     }
 
     void CreateDescriptorSetLayout()
@@ -747,6 +758,124 @@ private:
         _transferCommandPool = _device.createCommandPool(createInfo);
     }
 
+    void CreateTextureImage()
+    {
+        int texWidth, texHeight, texChannels;
+        stbi_uc* pixels = stbi_load("textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        vk::DeviceSize imageSize = texWidth * texHeight * 4;
+
+        if (!pixels)
+            throw std::runtime_error("Failed to load texture image");
+
+        auto [stagingBuffer, stagingBufferMemory] = CreateBuffer(imageSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+
+        void* data = _device.mapMemory(stagingBufferMemory, 0, imageSize);
+        memcpy(data, pixels, imageSize);
+        _device.unmapMemory(stagingBufferMemory);
+
+        stbi_image_free(pixels);
+
+        std::tie(_textureImage, _textureImageMemory) = CreateImage(texWidth, texHeight,
+                                                                         vk::Format::eR8G8B8A8Srgb,
+                                                                         vk::ImageTiling::eOptimal,
+                                                                         vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+                                                             vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+
+        vk::CommandBuffer commandBuffer = BeginSingleTimeCommands(_graphicsCommandPool);
+        TransitImageLayout(commandBuffer, _textureImage, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
+            vk::PipelineStageFlagBits2::eNone, {}, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+
+        CopyBufferToImage(commandBuffer, stagingBuffer, _textureImage, texWidth, texHeight);
+
+        TransitImageLayout(commandBuffer, _textureImage, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
+
+        EndSingleTimeCommands(commandBuffer, _graphicsQueue);
+
+        _device.destroyBuffer(stagingBuffer);
+        _device.freeMemory(stagingBufferMemory);
+    }
+
+    void CreateTextureImageView()
+    {
+        _textureImageView = CreateImageView(_textureImage, vk::Format::eR8G8B8A8Srgb);
+    }
+
+    void CreateTextureSampler()
+    {
+        vk::PhysicalDeviceProperties properties = _physicalDevice.getProperties();
+
+        vk::SamplerCreateInfo createInfo {};
+        createInfo.magFilter = vk::Filter::eLinear;
+        createInfo.minFilter = vk::Filter::eLinear;
+        createInfo.addressModeU = vk::SamplerAddressMode::eRepeat;
+        createInfo.addressModeV = vk::SamplerAddressMode::eRepeat;
+        createInfo.addressModeW = vk::SamplerAddressMode::eRepeat;
+        createInfo.anisotropyEnable = vk::True;
+        createInfo.maxAnisotropy = properties.limits.maxSamplerAnisotropy;
+        createInfo.compareEnable = vk::False;
+        createInfo.compareOp = vk::CompareOp::eAlways;
+        createInfo.borderColor = vk::BorderColor::eIntOpaqueBlack;
+        createInfo.unnormalizedCoordinates = vk::False;
+        createInfo.mipmapMode = vk::SamplerMipmapMode::eLinear;
+        createInfo.mipLodBias = 0.0f;
+        createInfo.minLod = 0.0f;
+        createInfo.maxLod = 0.0f;
+
+        _textureSampler = _device.createSampler(createInfo);
+    }
+
+    vk::ImageView CreateImageView(vk::Image image, vk::Format format)
+    {
+        vk::ImageViewCreateInfo createInfo {};
+        createInfo.image = image;
+        createInfo.format = format;
+        createInfo.viewType = vk::ImageViewType::e2D;
+        createInfo.subresourceRange = { .aspectMask = vk::ImageAspectFlagBits::eColor, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 };
+
+        return _device.createImageView(createInfo);
+    }
+
+    std::pair<vk::Image, vk::DeviceMemory> CreateImage(uint32_t width, uint32_t height, vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties)
+    {
+        vk::ImageCreateInfo createInfo {};
+        createInfo.imageType = vk::ImageType::e2D;
+        createInfo.format = format;
+        createInfo.extent = {width, height, 1};
+        createInfo.mipLevels = 1;
+        createInfo.arrayLayers = 1;
+        createInfo.samples = vk::SampleCountFlagBits::e1;
+        createInfo.tiling = tiling;
+        createInfo.usage = usage;
+        createInfo.sharingMode = vk::SharingMode::eExclusive;
+
+        vk::Image image = _device.createImage(createInfo);
+
+        vk::MemoryRequirements memRequirements = _device.getImageMemoryRequirements(image);
+        vk::MemoryAllocateInfo allocInfo {};
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = FindMemoryType(memRequirements.memoryTypeBits, properties);
+
+        vk::DeviceMemory imageMemory = _device.allocateMemory(allocInfo);
+        _device.bindImageMemory(image, imageMemory, 0);
+
+        return { image, imageMemory };
+    }
+
+    void CopyBufferToImage(vk::CommandBuffer commandBuffer, vk::Buffer buffer, vk::Image image, uint32_t width, uint32_t height)
+    {
+        vk::BufferImageCopy region {};
+        region.bufferOffset = 0;
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+        region.imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1};
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {width, height, 1};
+
+        commandBuffer.copyBufferToImage(buffer, image, vk::ImageLayout::eTransferDstOptimal, region);
+    }
+
     void CreateVertexBuffer()
     {
         vk::DeviceSize size = sizeof(vertices[0]) * vertices.size();
@@ -841,26 +970,11 @@ private:
         }
     }
 
-    void CopyBuffer(const vk::Buffer& src, const vk::Buffer& dst, vk::DeviceSize size) const
+    void CopyBuffer(const vk::Buffer& src, const vk::Buffer& dst, vk::DeviceSize size)
     {
-        vk::CommandBufferAllocateInfo allocInfo{ .commandPool = _transferCommandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1 };
-        vk::CommandBuffer commandCopyBuffer = _device.allocateCommandBuffers(allocInfo).front();
-
-        vk::CommandBufferBeginInfo commandBufferBeginInfo{};
-        commandBufferBeginInfo.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-        commandCopyBuffer.begin(commandBufferBeginInfo);
-
+        vk::CommandBuffer commandCopyBuffer = BeginSingleTimeCommands(_transferCommandPool);
         commandCopyBuffer.copyBuffer(src, dst, vk::BufferCopy(0, 0, size));
-        commandCopyBuffer.end();
-
-        vk::SubmitInfo submitInfo {};
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandCopyBuffer;
-
-        _transferQueue.submit(submitInfo);
-        _transferQueue.waitIdle();
-
-        _device.freeCommandBuffers(_transferCommandPool, commandCopyBuffer);
+        EndSingleTimeCommands(commandCopyBuffer, _transferQueue);
     }
 
     std::pair<vk::Buffer, vk::DeviceMemory> CreateBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties)
@@ -922,6 +1036,35 @@ private:
         _commandBuffers = _device.allocateCommandBuffers(allocInfo);
     }
 
+    vk::CommandBuffer BeginSingleTimeCommands(vk::CommandPool commandPool)
+    {
+        vk::CommandBufferAllocateInfo allocInfo {};
+        allocInfo.commandPool = commandPool;
+        allocInfo.level = vk::CommandBufferLevel::ePrimary;
+        allocInfo.commandBufferCount = 1;
+
+        vk::CommandBuffer commandBuffer = _device.allocateCommandBuffers(allocInfo).front();
+
+        vk::CommandBufferBeginInfo beginInfo {};
+        beginInfo.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+
+        commandBuffer.begin(beginInfo);
+
+        return commandBuffer;
+    }
+
+    void EndSingleTimeCommands(vk::CommandBuffer commandBuffer, vk::Queue queue)
+    {
+        commandBuffer.end();
+
+        vk::SubmitInfo submitInfo {};
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        queue.submit(submitInfo);
+        queue.waitIdle();
+    }
+
     void CreateSyncObjects()
     {
         for (int i = 0; i < _swapChainImages.size(); ++i)
@@ -942,13 +1085,15 @@ private:
         _commandBuffers[_frameIndex].begin(beginInfo);
 
         TransitImageLayout(
-            imageIndex,
+            _commandBuffers[_frameIndex],
+            _swapChainImages[imageIndex],
+            vk::ImageAspectFlagBits::eColor,
             vk::ImageLayout::eUndefined,
             vk::ImageLayout::eColorAttachmentOptimal,
-    {},
-    vk::AccessFlagBits2::eColorAttachmentWrite,
-    vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-    vk::PipelineStageFlagBits2::eColorAttachmentOutput
+            vk::PipelineStageFlagBits2::eNone,
+            {},
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::AccessFlagBits2::eColorAttachmentWrite
         );
 
         vk::ClearValue clearColor = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f);
@@ -981,52 +1126,62 @@ private:
         _commandBuffers[_frameIndex].endRendering();
 
         TransitImageLayout(
-            imageIndex,
+            _commandBuffers[_frameIndex],
+            _swapChainImages[imageIndex],
+            vk::ImageAspectFlagBits::eColor,
             vk::ImageLayout::eColorAttachmentOptimal,
             vk::ImageLayout::ePresentSrcKHR,
-            vk::AccessFlagBits2::eColorAttachmentWrite,
-            {},
             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-            vk::PipelineStageFlagBits2::eBottomOfPipe
+            vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::PipelineStageFlagBits2::eBottomOfPipe,
+            {}
         );
 
         _commandBuffers[_frameIndex].end();
     }
 
-    void TransitImageLayout(uint32_t imageIndex,
-        vk::ImageLayout         oldLayout,
-        vk::ImageLayout         newLayout,
-        vk::AccessFlags2        srcAccessMask,
-        vk::AccessFlags2        dstAccessMask,
+    void TransitImageLayout(
+        vk::CommandBuffer commandBuffer,
+        vk::Image image,
+        vk::ImageAspectFlags aspectMask,
+        vk::ImageLayout oldLayout,
+        vk::ImageLayout newLayout,
         vk::PipelineStageFlags2 srcStageMask,
-        vk::PipelineStageFlags2 dstStageMask) const
+        vk::AccessFlags2 srcAccessMask,
+        vk::PipelineStageFlags2 dstStageMask,
+        vk::AccessFlags2 dstAccessMask,
+        uint32_t baseMipLevel = 0,
+        uint32_t levelCount = 1,
+        uint32_t baseArrayLayer = 0,
+        uint32_t layerCount = 1
+    ) const
     {
-        vk::ImageMemoryBarrier2 barrier =
-        {
-            .srcStageMask        = srcStageMask,
-            .srcAccessMask       = srcAccessMask,
-            .dstStageMask        = dstStageMask,
-            .dstAccessMask       = dstAccessMask,
-            .oldLayout           = oldLayout,
-            .newLayout           = newLayout,
+        vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = srcStageMask,
+            .srcAccessMask = srcAccessMask,
+            .dstStageMask = dstStageMask,
+            .dstAccessMask = dstAccessMask,
+            .oldLayout = oldLayout,
+            .newLayout = newLayout,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image               = _swapChainImages[imageIndex],
-            .subresourceRange    =
-         {
-                .aspectMask      = vk::ImageAspectFlagBits::eColor,
-                .baseMipLevel    = 0,
-                .levelCount      = 1,
-                .baseArrayLayer  = 0,
-                .layerCount      = 1
+            .image = image,
+            .subresourceRange = {
+                .aspectMask = aspectMask,
+                .baseMipLevel = baseMipLevel,
+                .levelCount = levelCount,
+                .baseArrayLayer = baseArrayLayer,
+                .layerCount = layerCount
             }
         };
-        vk::DependencyInfo dependencyInfo = {
-            .dependencyFlags         = {},
-            .imageMemoryBarrierCount = 1,
-            .pImageMemoryBarriers    = &barrier};
 
-        _commandBuffers[_frameIndex].pipelineBarrier2(dependencyInfo);
+        vk::DependencyInfo dependencyInfo{
+            .dependencyFlags = {},
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &barrier
+        };
+
+        commandBuffer.pipelineBarrier2(dependencyInfo);
     }
 
     vk::ShaderModule CreateShaderModule(const std::vector<char>& code) const
