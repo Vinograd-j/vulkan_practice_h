@@ -5,12 +5,15 @@
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 #include <fstream>
 #include <set>
+#include <unordered_map>
 #include <vulkan/vulkan.hpp>
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
+#define GLM_ENABLE_EXPERIMENTAL
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/hash.hpp>
 
 #include <chrono>
 
@@ -19,8 +22,15 @@ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#define TINYOBJLOADER_DISABLE_FAST_FLOAT
+#define TINYOBJLOADER_IMPLEMENTATION
+#include "tiny_obj_loader.h"
+
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
+
+const std::string MODEL_PATH = "models/viking_room.obj";
+const std::string TEXTURE_PATH = "textures/viking_room.png";
 
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
@@ -88,7 +98,22 @@ struct Vertex
         }};
     }
 
+    bool operator==(const Vertex &other) const
+    {
+        return position == other.position && color == other.color && texCoord == other.texCoord;
+    }
+
 };
+
+template <>
+struct std::hash<Vertex>
+{
+    size_t operator()(Vertex const &vertex) const noexcept
+    {
+        return ((hash<glm::vec3>()(vertex.position) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^ (hash<glm::vec2>()(vertex.texCoord) << 1);
+    }
+};
+
 
 struct UniformBufferObject
 {
@@ -97,23 +122,6 @@ struct UniformBufferObject
     glm::mat4 view;
 
     glm::mat4 projection;
-};
-
-std::vector<Vertex> vertices = {
-    {{0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-{{-0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-{{-0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-{{0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
-
-{{0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-{{-0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-{{-0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-{{0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}
-};
-
-const std::vector<uint16_t> indices = {
-    1, 0, 2, 0, 3, 2,
-    5, 4, 6, 4, 7, 6
 };
 
 class HelloTriangleApplication
@@ -183,6 +191,9 @@ private:
     uint32_t _frameIndex = 0;
     bool _framebufferResized = false;
 
+    std::vector<Vertex> _vertices;
+    std::vector<uint32_t> _indices;
+
     vk::Buffer _vertexBuffer {};
     vk::DeviceMemory _vertexBufferMemory {};
 
@@ -239,6 +250,7 @@ private:
         CreateTextureImage();
         CreateTextureImageView();
         CreateTextureSampler();
+        LoadModel();
         CreateVertexBuffer();
         CreateIndexBuffer();
         CreateUniformBuffers();
@@ -332,7 +344,8 @@ private:
         float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
 
         UniformBufferObject ubo {};
-        ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        // ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        ubo.model = glm::mat4(1.0f);
         ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
         ubo.projection = glm::perspective(glm::radians(45.0f), static_cast<float>(_swapChainExtent.width) / static_cast<float>(_swapChainExtent.height), 0.1f, 10.0f);
 
@@ -858,7 +871,7 @@ private:
     void CreateTextureImage()
     {
         int texWidth, texHeight, texChannels;
-        stbi_uc* pixels = stbi_load("textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
         vk::DeviceSize imageSize = texWidth * texHeight * 4;
 
         if (!pixels)
@@ -923,6 +936,45 @@ private:
         _textureSampler = _device.createSampler(createInfo);
     }
 
+    void LoadModel()
+    {
+        tinyobj::attrib_t attrib;
+        std::vector<tinyobj::shape_t> shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string warn, err;
+
+        if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, MODEL_PATH.c_str()))
+            throw std::runtime_error(warn + err);
+
+        std::unordered_map<Vertex, uint32_t> uniqueVertices {};
+        for (const auto& shape : shapes)
+        {
+            for (const auto& index : shape.mesh.indices)
+            {
+                Vertex vertex {};
+
+                vertex.position = {
+                    attrib.vertices[3 * index.vertex_index + 0],
+                    attrib.vertices[3 * index.vertex_index + 1],
+                    attrib.vertices[3 * index.vertex_index + 2]
+                };
+
+                vertex.texCoord = {
+                    attrib.texcoords[2 * index.texcoord_index + 0],
+                    1.0f - attrib.texcoords[2 * index.texcoord_index + 1]
+                };
+
+                vertex.color = { 1.0f, 1.0f, 1.0f };
+
+                auto [it, inserted] = uniqueVertices.insert({vertex, static_cast<uint32_t>(_vertices.size())});
+                if (inserted)
+                    _vertices.push_back(vertex);
+
+                _indices.push_back(it->second);
+            }
+        }
+    }
+
     vk::ImageView CreateImageView(vk::Image image, vk::Format format, vk::ImageAspectFlagBits aspectFlags)
     {
         vk::ImageViewCreateInfo createInfo {};
@@ -975,12 +1027,12 @@ private:
 
     void CreateVertexBuffer()
     {
-        vk::DeviceSize size = sizeof(vertices[0]) * vertices.size();
+        vk::DeviceSize size = sizeof(_vertices[0]) * _vertices.size();
 
         auto [stagingBuffer, stagingBufferMemory] = CreateBuffer(size, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostVisible);
 
         void* dataStaging = _device.mapMemory(stagingBufferMemory, 0, size);
-        memcpy(dataStaging, vertices.data(), size);
+        memcpy(dataStaging, _vertices.data(), size);
         _device.unmapMemory(stagingBufferMemory);
 
         std::tie(_vertexBuffer, _vertexBufferMemory) = CreateBuffer(size, vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
@@ -993,12 +1045,12 @@ private:
 
     void CreateIndexBuffer()
     {
-        vk::DeviceSize size = sizeof(indices[0]) * indices.size();
+        vk::DeviceSize size = sizeof(_indices[0]) * _indices.size();
 
         auto [stagingBuffer, stagingBufferMemory] = CreateBuffer(size, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostVisible);
 
         void* dataStaging = _device.mapMemory(stagingBufferMemory, 0, size);
-        memcpy(dataStaging, indices.data(), size);
+        memcpy(dataStaging, _indices.data(), size);
         _device.unmapMemory(stagingBufferMemory);
 
         std::tie(_indexBuffer, _indexBufferMemory) = CreateBuffer(size, vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
@@ -1252,13 +1304,13 @@ private:
         _commandBuffers[_frameIndex].bindPipeline(vk::PipelineBindPoint::eGraphics, _pipeline);
 
         _commandBuffers[_frameIndex].bindVertexBuffers(0, _vertexBuffer, {0});
-        _commandBuffers[_frameIndex].bindIndexBuffer(_indexBuffer, 0, vk::IndexType::eUint16);
+        _commandBuffers[_frameIndex].bindIndexBuffer(_indexBuffer, 0, vk::IndexTypeValue<decltype(_indices)::value_type>::value);
 
         _commandBuffers[_frameIndex].setViewport(0, vk::Viewport(0.0, static_cast<float>(_swapChainExtent.height), static_cast<float>(_swapChainExtent.width), -static_cast<float>(_swapChainExtent.height), 0.0f, 1.0f));
         _commandBuffers[_frameIndex].setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), _swapChainExtent));
 
         _commandBuffers[_frameIndex].bindDescriptorSets(vk::PipelineBindPoint::eGraphics, _pipelineLayout, 0, _descriptorSets[_frameIndex], nullptr);
-        _commandBuffers[_frameIndex].drawIndexed(indices.size(), 1, 0, 0, 0);
+        _commandBuffers[_frameIndex].drawIndexed(_indices.size(), 1, 0, 0, 0);
 
         _commandBuffers[_frameIndex].endRendering();
 
