@@ -214,6 +214,11 @@ private:
     vk::DeviceMemory _depthImageMemory {};
     vk::ImageView _depthImageView {};
 
+    vk::SampleCountFlagBits _msaaSamples = vk::SampleCountFlagBits::e1;
+    vk::Image _colorImage {};
+    vk::ImageView _colorImageView {};
+    vk::DeviceMemory _colorImageMemory {};
+
 private:
 
     void InitWindow()
@@ -240,6 +245,7 @@ private:
         SetupDebugMessenger();
         CreateSurface();
         PickPhysicalDevice();
+        _msaaSamples = GetMaxUsableSampleCount();
         CreateLogicalDevice();
         CreateSwapChain();
         CreateImageViews();
@@ -247,6 +253,7 @@ private:
         CreateGraphicsPipeline();
         CreateGraphicsCommandPool();
         CreateTransferCommandPool();
+        CreateColorResouces();
         CreateDepthResources();
         CreateTextureImage();
         CreateTextureImageView();
@@ -373,6 +380,7 @@ private:
         _device.destroyBuffer(_indexBuffer);
         _device.freeMemory(_indexBufferMemory);
 
+        CleanupColorResouces();
         CleanupDepthResouces();
 
         for (auto uniformBuffer : _uniformBuffers)
@@ -557,6 +565,22 @@ private:
         _physicalDevice = *deviceIterator;
     }
 
+    vk::SampleCountFlagBits GetMaxUsableSampleCount() const
+    {
+        vk::PhysicalDeviceProperties properties = _physicalDevice.getProperties();
+
+        vk::SampleCountFlags counts = properties.limits.framebufferColorSampleCounts & properties.limits.framebufferDepthSampleCounts;
+
+        if (counts & vk::SampleCountFlagBits::e64) { return vk::SampleCountFlagBits::e64; }
+        if (counts & vk::SampleCountFlagBits::e32) { return vk::SampleCountFlagBits::e32; }
+        if (counts & vk::SampleCountFlagBits::e16) { return vk::SampleCountFlagBits::e16; }
+        if (counts & vk::SampleCountFlagBits::e8) { return vk::SampleCountFlagBits::e8; }
+        if (counts & vk::SampleCountFlagBits::e4) { return vk::SampleCountFlagBits::e4; }
+        if (counts & vk::SampleCountFlagBits::e2) { return vk::SampleCountFlagBits::e2; }
+
+        return vk::SampleCountFlagBits::e1;
+    }
+
     void CreateLogicalDevice()
     {
         std::vector<vk::QueueFamilyProperties> queueFamilyProperties = _physicalDevice.getQueueFamilyProperties();
@@ -669,6 +693,13 @@ private:
         _device.destroyImageView(_depthImageView);
     }
 
+    void CleanupColorResouces()
+    {
+        _device.destroyImage(_colorImage);
+        _device.freeMemory(_colorImageMemory);
+        _device.destroyImageView(_colorImageView);
+    }
+
     void RecreateSwapChain()
     {
         int width, height = 0;
@@ -688,6 +719,9 @@ private:
         CreateImageViews();
 
         CleanupDepthResouces();
+        CleanupColorResouces();
+
+        CreateColorResouces();
         CreateDepthResources();
     }
 
@@ -765,7 +799,7 @@ private:
         rasterizerCreateInfo.lineWidth = 1.0f;
 
         vk::PipelineMultisampleStateCreateInfo multisampling {};
-        multisampling.rasterizationSamples = vk::SampleCountFlagBits::e1;
+        multisampling.rasterizationSamples = _msaaSamples;
         multisampling.sampleShadingEnable = vk::False;
 
         vk::PipelineColorBlendAttachmentState colorBlendAttachment{
@@ -787,7 +821,6 @@ private:
         depthStencil.depthCompareOp = vk::CompareOp::eLess;
         depthStencil.depthBoundsTestEnable = vk::False;
         depthStencil.stencilTestEnable = vk::False;
-
 
         vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo {};
         pipelineRenderingCreateInfo.colorAttachmentCount = 1;
@@ -833,6 +866,22 @@ private:
         _transferCommandPool = _device.createCommandPool(createInfo);
     }
 
+    void CreateColorResouces()
+    {
+        vk::Format colorFormat = _surfaceFormat.format;
+
+        std::tie(_colorImage, _colorImageMemory) = CreateImage(
+                                                                     _swapChainExtent.width, _swapChainExtent.height,
+                                                                     1,
+                                                                     _msaaSamples,
+                                                                     colorFormat,
+                                                                     vk::ImageTiling::eOptimal,
+                                                                     vk::ImageUsageFlagBits::eTransientAttachment | vk::ImageUsageFlagBits::eColorAttachment,
+                                                                     vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+        _colorImageView = CreateImageView(_colorImage, colorFormat, vk::ImageAspectFlagBits::eColor, 1);
+    }
+
     void CreateDepthResources()
     {
         vk::Format format = FindDepthFormat();
@@ -840,7 +889,9 @@ private:
         std::tie(_depthImage, _depthImageMemory) = CreateImage(
                                                                      _swapChainExtent.width, _swapChainExtent.height,
                                                                      1,
-                                                                     format, vk::ImageTiling::eOptimal,
+                                                                     _msaaSamples,
+                                                                     format,
+                                                                     vk::ImageTiling::eOptimal,
                                                                      vk::ImageUsageFlagBits::eDepthStencilAttachment,
                                                                      vk::MemoryPropertyFlagBits::eDeviceLocal);
 
@@ -891,6 +942,7 @@ private:
 
         std::tie(_textureImage, _textureImageMemory) = CreateImage(texWidth, texHeight,
                                                                          _mipLevels,
+                                                                         vk::SampleCountFlagBits::e1,
                                                                          vk::Format::eR8G8B8A8Srgb,
                                                                          vk::ImageTiling::eOptimal,
                                                                          vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
@@ -1065,7 +1117,7 @@ private:
         return _device.createImageView(createInfo);
     }
 
-    std::pair<vk::Image, vk::DeviceMemory> CreateImage(uint32_t width, uint32_t height, uint32_t mipLevels, vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties)
+    std::pair<vk::Image, vk::DeviceMemory> CreateImage(uint32_t width, uint32_t height, uint32_t mipLevels, vk::SampleCountFlagBits numSamples, vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties)
     {
         vk::ImageCreateInfo createInfo {};
         createInfo.imageType = vk::ImageType::e2D;
@@ -1073,7 +1125,7 @@ private:
         createInfo.extent = {width, height, 1};
         createInfo.mipLevels = mipLevels;
         createInfo.arrayLayers = 1;
-        createInfo.samples = vk::SampleCountFlagBits::e1;
+        createInfo.samples = numSamples;
         createInfo.tiling = tiling;
         createInfo.usage = usage;
         createInfo.sharingMode = vk::SharingMode::eExclusive;
@@ -1357,8 +1409,11 @@ private:
         vk::ClearValue clearDepth = vk::ClearDepthStencilValue(1.0f, 0);
 
         vk::RenderingAttachmentInfo colorAttachmentInfo {};
-        colorAttachmentInfo.imageView = _swapChainImageViews[imageIndex];
+        colorAttachmentInfo.imageView = _colorImageView;
         colorAttachmentInfo.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+        colorAttachmentInfo.resolveMode = vk::ResolveModeFlagBits::eAverage;
+        colorAttachmentInfo.resolveImageView = _swapChainImageViews[imageIndex];
+        colorAttachmentInfo.resolveImageLayout = vk::ImageLayout::eColorAttachmentOptimal;
         colorAttachmentInfo.loadOp = vk::AttachmentLoadOp::eClear;
         colorAttachmentInfo.storeOp = vk::AttachmentStoreOp::eStore;
         colorAttachmentInfo.clearValue = clearColor;
